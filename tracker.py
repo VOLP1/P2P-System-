@@ -35,22 +35,12 @@ from typing import Dict, List, Set
 import logging
 
 # Configuração de logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 @dataclass
 class InfoPeer:
     """
     Classe para armazenar informações de cada peer na rede.
-    
-    Atributos:
-        id (str): Identificador único do peer
-        ip (str): Endereço IP do peer
-        porta (int): Porta de conexão do peer
-        arquivos (List[str]): Lista de arquivos compartilhados
-        volume_upload (float): Volume total de dados enviados em MB
-        tempo_conexao (float): Tempo total de conexão em segundos
-        ultima_vez_visto (float): Timestamp da última atividade
-        pontuacao_colaborativa (float): Métrica de colaboração do peer
     """
     id: str
     ip: str
@@ -62,21 +52,7 @@ class InfoPeer:
     pontuacao_colaborativa: float = 0.0
 
 class Tracker:
-    """
-    Implementação do servidor tracker centralizado.
-    
-    Esta classe gerencia toda a lógica do tracker, incluindo conexões,
-    registro de peers, busca de arquivos e sistema de incentivo.
-    """
-
     def __init__(self, host: str = "localhost", porta: int = 55555):
-        """
-        Inicializa o servidor tracker.
-
-        Args:
-            host (str): Endereço IP do servidor
-            porta (int): Porta para conexões
-        """
         self.host = host
         self.porta = porta
         self.peers: Dict[str, InfoPeer] = {}
@@ -85,94 +61,35 @@ class Tracker:
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.trava = threading.Lock()
 
-    def iniciar(self):
-        """
-        Inicia o servidor tracker e começa a aceitar conexões.
-        Também inicia a thread de limpeza de peers inativos.
-        """
-        self.socket.bind((self.host, self.porta))
-        self.socket.listen(100)
-        logging.info(f"Tracker iniciado em {self.host}:{self.porta}")
-
-        thread_limpeza = threading.Thread(target=self._limpar_peers_inativos)
-        thread_limpeza.daemon = True
-        thread_limpeza.start()
-
-        while True:
-            socket_cliente, endereco = self.socket.accept()
-            thread_cliente = threading.Thread(
-                target=self._gerenciar_cliente,
-                args=(socket_cliente, endereco)
-            )
-            thread_cliente.daemon = True
-            thread_cliente.start()
-
-    def _gerenciar_cliente(self, socket_cliente: socket.socket, endereco: tuple):
-        """
-        Gerencia a comunicação com um cliente conectado.
-
-        Args:
-            socket_cliente: Socket do cliente conectado
-            endereco: Tupla (ip, porta) do cliente
-        """
-        try:
-            while True:
-                dados = socket_cliente.recv(4096).decode('utf-8')
-                if not dados:
-                    break
-
-                try:
-                    mensagem = json.loads(dados)
-                    resposta = self._processar_mensagem(mensagem, endereco)
-                    socket_cliente.send(json.dumps(resposta).encode('utf-8'))
-                except json.JSONDecodeError:
-                    logging.error(f"Erro ao decodificar mensagem: {dados}")
-                    socket_cliente.send(json.dumps({
-                        "status": "erro",
-                        "mensagem": "Formato JSON inválido"
-                    }).encode('utf-8'))
-
-        except Exception as e:
-            logging.error(f"Erro na conexão com {endereco}: {str(e)}")
-        finally:
-            socket_cliente.close()
-
     def _processar_mensagem(self, mensagem: dict, endereco: tuple) -> dict:
         """
         Processa as mensagens recebidas dos peers.
-
-        Args:
-            mensagem: Dicionário com o comando e dados da mensagem
-            endereco: Tupla (ip, porta) do remetente
-
-        Returns:
-            dict: Resposta ao comando recebido
         """
         comando = mensagem.get("comando")
+        logging.debug(f"Processando comando: {comando}")
         
-        if comando == "registrar":
-            return self._registrar_peer(mensagem, endereco)
-        elif comando == "atualizar":
-            return self._atualizar_peer(mensagem)
-        elif comando == "buscar":
-            return self._buscar_arquivos(mensagem)
-        elif comando == "info_peer":
-            return self._obter_info_peer(mensagem)
-        elif comando == "heartbeat":
-            return self._processar_heartbeat(mensagem)
-        else:
-            return {"status": "erro", "mensagem": "Comando desconhecido"}
+        try:
+            if comando == "registrar":
+                return self._registrar_peer(mensagem, endereco)
+            elif comando == "atualizar":
+                return self._atualizar_peer(mensagem)
+            elif comando == "buscar":
+                return self._buscar_arquivos(mensagem)
+            elif comando == "info_peer":
+                resposta = self._obter_info_peer(mensagem)
+                logging.debug(f"Resposta info_peer: {resposta}")
+                return resposta
+            elif comando == "heartbeat":
+                return self._processar_heartbeat(mensagem)
+            else:
+                return {"status": "erro", "mensagem": "Comando desconhecido"}
+        except Exception as e:
+            logging.error(f"Erro ao processar mensagem: {str(e)}")
+            return {"status": "erro", "mensagem": str(e)}
 
     def _registrar_peer(self, mensagem: dict, endereco: tuple) -> dict:
         """
         Registra um novo peer no sistema.
-
-        Args:
-            mensagem: Dados do peer para registro
-            endereco: Endereço do peer
-
-        Returns:
-            dict: Confirmação do registro
         """
         with self.trava:
             peer_id = mensagem.get("peer_id")
@@ -201,12 +118,6 @@ class Tracker:
     def _atualizar_peer(self, mensagem: dict) -> dict:
         """
         Atualiza as informações de um peer existente.
-
-        Args:
-            mensagem: Dicionário contendo as novas informações do peer
-
-        Returns:
-            dict: Confirmação da atualização
         """
         with self.trava:
             peer_id = mensagem.get("peer_id")
@@ -230,12 +141,6 @@ class Tracker:
     def _buscar_arquivos(self, mensagem: dict) -> dict:
         """
         Realiza busca de arquivos na rede.
-
-        Args:
-            mensagem: Dicionário contendo o termo de busca
-
-        Returns:
-            dict: Resultados da busca com peers que possuem os arquivos
         """
         termo_busca = mensagem.get("termo", "").lower()
         resultados = {}
@@ -266,13 +171,42 @@ class Tracker:
             "resultados": resultados
         }
 
+    def _obter_info_peer(self, mensagem: dict) -> dict:
+        """
+        Retorna informações detalhadas sobre um peer específico.
+        """
+        peer_id = mensagem.get("peer_id")
+        logging.debug(f"Obtendo informações para peer: {peer_id}")
+        
+        if peer_id in self.peers:
+            peer = self.peers[peer_id]
+            resposta = {
+                "status": "sucesso",
+                "ip": peer.ip,
+                "porta": peer.porta
+            }
+            logging.debug(f"Retornando informações: {resposta}")
+            return resposta
+        
+        logging.error(f"Peer {peer_id} não encontrado")
+        return {
+            "status": "erro",
+            "mensagem": "Peer não encontrado"
+        }
+
+    def _processar_heartbeat(self, mensagem: dict) -> dict:
+        """
+        Processa sinais de heartbeat dos peers.
+        """
+        peer_id = mensagem.get("peer_id")
+        if peer_id in self.peers:
+            self.peers[peer_id].ultima_vez_visto = time.time()
+            return {"status": "sucesso", "mensagem": "Heartbeat recebido"}
+        return {"status": "erro", "mensagem": "Peer não encontrado"}
+
     def _atualizar_indice_arquivos(self, peer_id: str, arquivos: List[str]):
         """
         Atualiza o índice de arquivos compartilhados.
-
-        Args:
-            peer_id: Identificador do peer
-            arquivos: Lista de arquivos compartilhados pelo peer
         """
         for arquivo_peers in self.indice_arquivos.values():
             arquivo_peers.discard(peer_id)
@@ -285,9 +219,6 @@ class Tracker:
     def _atualizar_pontuacao_colaborativa(self, peer_id: str):
         """
         Calcula e atualiza a pontuação colaborativa de um peer.
-
-        Args:
-            peer_id: Identificador do peer
         """
         peer = self.peers[peer_id]
         
@@ -303,12 +234,54 @@ class Tracker:
             pontos_arquivos * 0.3
         )
 
+    def _gerenciar_cliente(self, socket_cliente: socket.socket, endereco: tuple):
+        """
+        Gerencia a comunicação com um cliente conectado.
+        """
+        try:
+            while True:  # Loop para manter a conexão
+                dados = socket_cliente.recv(4096).decode('utf-8')
+                if not dados:
+                    break
+
+                try:
+                    mensagem = json.loads(dados)
+                    resposta = self._processar_mensagem(mensagem, endereco)
+                    
+                    # Debug log
+                    logging.debug(f"Enviando resposta: {resposta}")
+                    
+                    # Garante que a resposta é um dicionário válido
+                    if not isinstance(resposta, dict):
+                        resposta = {"status": "erro", "mensagem": "Resposta inválida do servidor"}
+                    
+                    # Envia a resposta
+                    resposta_json = json.dumps(resposta)
+                    socket_cliente.send(resposta_json.encode('utf-8'))
+                    
+                except json.JSONDecodeError as e:
+                    logging.error(f"Erro ao decodificar mensagem: {dados}")
+                    erro_resp = json.dumps({
+                        "status": "erro",
+                        "mensagem": "Formato JSON inválido"
+                    })
+                    socket_cliente.send(erro_resp.encode('utf-8'))
+                except Exception as e:
+                    logging.error(f"Erro ao processar mensagem: {str(e)}")
+                    erro_resp = json.dumps({
+                        "status": "erro",
+                        "mensagem": str(e)
+                    })
+                    socket_cliente.send(erro_resp.encode('utf-8'))
+
+        except Exception as e:
+            logging.error(f"Erro na conexão com {endereco}: {str(e)}")
+        finally:
+            socket_cliente.close()
+
     def _limpar_peers_inativos(self, tempo_limite: int = 300):
         """
         Remove peers que estão inativos por muito tempo.
-
-        Args:
-            tempo_limite: Tempo em segundos após o qual um peer é considerado inativo
         """
         while True:
             time.sleep(60)  # Verifica a cada minuto
@@ -326,45 +299,30 @@ class Tracker:
                     for arquivo_peers in self.indice_arquivos.values():
                         arquivo_peers.discard(peer_id)
 
-    def _processar_heartbeat(self, mensagem: dict) -> dict:
+    def iniciar(self):
         """
-        Processa sinais de heartbeat dos peers.
-
-        Args:
-            mensagem: Mensagem contendo o ID do peer
-
-        Returns:
-            dict: Confirmação do recebimento do heartbeat
+        Inicia o servidor tracker.
         """
-        peer_id = mensagem.get("peer_id")
-        if peer_id in self.peers:
-            self.peers[peer_id].ultima_vez_visto = time.time()
-            return {"status": "sucesso", "mensagem": "Heartbeat recebido"}
-        return {"status": "erro", "mensagem": "Peer não encontrado"}
+        self.socket.bind((self.host, self.porta))
+        self.socket.listen(100)
+        logging.info(f"Tracker iniciado em {self.host}:{self.porta}")
 
-    def _obter_info_peer(self, mensagem: dict) -> dict:
-        """
-        Retorna informações detalhadas sobre um peer específico.
+        thread_limpeza = threading.Thread(target=self._limpar_peers_inativos)
+        thread_limpeza.daemon = True
+        thread_limpeza.start()
 
-        Args:
-            mensagem: Mensagem contendo o ID do peer
-
-        Returns:
-            dict: Informações detalhadas do peer
-        """
-        peer_id = mensagem.get("peer_id")
-        if peer_id in self.peers:
-            peer = self.peers[peer_id]
-            return {
-                "status": "sucesso",
-                "info_peer": asdict(peer)
-            }
-        return {"status": "erro", "mensagem": "Peer não encontrado"}
+        while True:
+            socket_cliente, endereco = self.socket.accept()
+            thread_cliente = threading.Thread(
+                target=self._gerenciar_cliente,
+                args=(socket_cliente, endereco)
+            )
+            thread_cliente.daemon = True
+            thread_cliente.start()
 
 if __name__ == "__main__":
     """
     Ponto de entrada principal do programa.
-    Inicia o servidor tracker e mantém ele rodando até ser interrompido.
     """
     tracker = Tracker()
     try:
