@@ -4,6 +4,7 @@ import time
 import logging
 import random
 import shutil
+import hashlib
 from tracker import Tracker
 from peer_client import PeerClient
 import threading
@@ -32,26 +33,48 @@ def criar_arquivo_grande(caminho: str, tamanho_mb: int = 10):
 
 def verificar_arquivos(arquivo1: str, arquivo2: str) -> bool:
     """Verifica se dois arquivos são idênticos"""
+    logging.info(f"Iniciando verificação de arquivos")
+    logging.info(f"Arquivo 1: {arquivo1}")
+    logging.info(f"Arquivo 2: {arquivo2}")
+    
     if not os.path.exists(arquivo2):
         logging.error(f"Arquivo {arquivo2} não existe")
         return False
         
-    if os.path.getsize(arquivo1) != os.path.getsize(arquivo2):
-        logging.error("Tamanhos diferentes")
+    tamanho1 = os.path.getsize(arquivo1)
+    tamanho2 = os.path.getsize(arquivo2)
+    logging.info(f"Tamanho arquivo 1: {tamanho1}")
+    logging.info(f"Tamanho arquivo 2: {tamanho2}")
+    
+    if tamanho1 != tamanho2:
+        logging.error(f"Tamanhos diferentes: {tamanho1} != {tamanho2}")
         return False
     
+    # Lê e compara em blocos para evitar carregar arquivo inteiro na memória
+    tamanho_bloco = 8192
     with open(arquivo1, 'rb') as f1, open(arquivo2, 'rb') as f2:
+        posicao = 0
         while True:
-            bloco1 = f1.read(8192)
-            bloco2 = f2.read(8192)
+            bloco1 = f1.read(tamanho_bloco)
+            bloco2 = f2.read(tamanho_bloco)
             
             if bloco1 != bloco2:
-                logging.error("Conteúdo diferente")
+                logging.error(f"Conteúdo diferente na posição {posicao}")
+                # Mostra os primeiros bytes diferentes
+                for i, (b1, b2) in enumerate(zip(bloco1[:32], bloco2[:32])):
+                    if b1 != b2:
+                        logging.error(f"Primeiro byte diferente na posição {posicao + i}: {b1} != {b2}")
+                        break
                 return False
                 
             if not bloco1:
                 break
+                
+            posicao += len(bloco1)
+            if posicao % (1024 * 1024) == 0:  # Log a cada 1MB
+                logging.info(f"Verificado: {posicao/tamanho1*100:.1f}%")
     
+    logging.info("Verificação concluída com sucesso")
     return True
 
 def testar_transferencia_paralela():
@@ -68,6 +91,11 @@ def testar_transferencia_paralela():
         # Cria arquivo grande para teste
         arquivo_teste = os.path.join("peer1_files", "arquivo_grande.dat")
         criar_arquivo_grande(arquivo_teste, tamanho_mb=20)  # 20MB
+        
+        # Verifica hash do arquivo original
+        with open(arquivo_teste, 'rb') as f:
+            hash_original = hashlib.sha256(f.read()).hexdigest()
+            logging.info(f"Hash do arquivo original: {hash_original}")
         
         # Inicia tracker
         tracker = Tracker()
@@ -106,7 +134,22 @@ def testar_transferencia_paralela():
         while not os.path.exists(arquivo_destino) and (time.time() - inicio) < timeout:
             time.sleep(0.1)
         
+        if not os.path.exists(arquivo_destino):
+            logging.error("Arquivo não foi criado após timeout")
+            return False
+            
         tempo_total = time.time() - inicio
+        
+        # Verifica tamanho
+        tamanho_original = os.path.getsize(arquivo_teste)
+        tamanho_destino = os.path.getsize(arquivo_destino)
+        logging.info(f"Tamanho original: {tamanho_original}")
+        logging.info(f"Tamanho destino: {tamanho_destino}")
+        
+        # Verifica hash do arquivo transferido
+        with open(arquivo_destino, 'rb') as f:
+            hash_destino = hashlib.sha256(f.read()).hexdigest()
+            logging.info(f"Hash do arquivo transferido: {hash_destino}")
         
         # Verifica resultado
         if verificar_arquivos(arquivo_teste, arquivo_destino):
@@ -121,6 +164,7 @@ def testar_transferencia_paralela():
             
     except Exception as e:
         logging.error(f"Erro durante teste: {str(e)}")
+        logging.exception("Stack trace completo:")
         return False
     finally:
         # Limpa ambiente
@@ -137,6 +181,7 @@ def main():
         logging.info("\nTeste interrompido pelo usuário")
     except Exception as e:
         logging.error(f"Erro nos testes: {str(e)}")
+        logging.exception("Stack trace completo:")
 
 if __name__ == "__main__":
     main()

@@ -59,18 +59,26 @@ class Tracker:
 
     def _processar_conexao(self, sock: socket.socket, addr: tuple):
         """Processa uma conexão de um peer"""
+        sock.settimeout(None)  # Remove timeout
         try:
             while True:
-                dados = sock.recv(1024)
-                if not dados:
+                try:
+                    dados = sock.recv(1024)
+                    if not dados:
+                        break
+                        
+                    mensagem = json.loads(dados.decode().strip())
+                    logging.debug(f"Mensagem recebida de {addr}: {mensagem}")
+                    resposta = self._processar_mensagem(mensagem, addr)
+                    dados_resposta = json.dumps(resposta).encode() + b'\n'
+                    sock.sendall(dados_resposta)
+                except json.JSONDecodeError:
+                    logging.error(f"Erro ao decodificar mensagem de {addr}")
+                    continue
+                except Exception as e:
+                    logging.error(f"Erro ao processar mensagem de {addr}: {e}")
                     break
                     
-                mensagem = json.loads(dados.decode())
-                logging.debug(f"Mensagem recebida de {addr}: {mensagem}")
-                resposta = self._processar_mensagem(mensagem, addr)
-                logging.debug(f"Enviando resposta: {resposta}")
-                sock.send(json.dumps(resposta).encode())
-                
         except Exception as e:
             logging.error(f"Erro ao processar conexão de {addr}: {e}")
         finally:
@@ -248,16 +256,19 @@ class Tracker:
     def _limpar_peers_inativos(self):
         """Remove peers inativos"""
         while True:
-            time.sleep(60)
-            with self.lock:
-                tempo_atual = time.time()
-                inativos = [
-                    peer_id for peer_id, peer in self.peers.items()
-                    if tempo_atual - peer.ultima_vez_visto > 120
-                ]
-                for peer_id in inativos:
-                    del self.peers[peer_id]
-                    logging.info(f"Peer removido por inatividade: {peer_id}")
+            try:
+                time.sleep(60)
+                with self.lock:
+                    tempo_atual = time.time()
+                    inativos = [
+                        peer_id for peer_id, peer in self.peers.items()
+                        if tempo_atual - peer.ultima_vez_visto > 120
+                    ]
+                    for peer_id in inativos:
+                        del self.peers[peer_id]
+                        logging.info(f"Peer removido por inatividade: {peer_id}")
+            except Exception as e:
+                logging.error(f"Erro ao limpar peers inativos: {e}")
 
 if __name__ == "__main__":
     tracker = Tracker()
