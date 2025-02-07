@@ -76,59 +76,6 @@ class Tracker:
         finally:
             sock.close()
 
-
-    def _calcular_pontuacao(self, peer_id: str) -> float:
-        """Calcula a pontuação de um peer baseado em suas métricas"""
-        peer = self.peers[peer_id]
-        
-        # Fatores de pontuação (pesos)
-        PESO_ARQUIVOS = 0.3     # 30% baseado no número de arquivos
-        PESO_UPLOAD = 0.4       # 40% baseado no volume de upload
-        PESO_TEMPO = 0.3        # 30% baseado no tempo online
-        
-        # Cálculo dos componentes
-        pontos_arquivos = min(1.0, len(peer.arquivos) / 10)  # Máximo com 10 arquivos
-        pontos_upload = min(1.0, peer.bytes_enviados / (100 * 1024 * 1024))  # Máximo com 100MB
-        pontos_tempo = min(1.0, peer.tempo_online / (24 * 3600))  # Máximo com 24 horas
-        
-        # Pontuação final (0.0 a 1.0)
-        pontuacao = (
-            pontos_arquivos * PESO_ARQUIVOS +
-            pontos_upload * PESO_UPLOAD +
-            pontos_tempo * PESO_TEMPO
-        )
-        
-        logging.debug(f"Pontuação calculada para {peer_id}: {pontuacao:.2f}")
-        return pontuacao
-
-    def _atualizar_metricas(self, peer_id: str, comando: str, **kwargs):
-        """Atualiza as métricas de um peer"""
-        with self.lock:
-            if peer_id not in self.peers:
-                return
-                
-            peer = self.peers[peer_id]
-            tempo_atual = time.time()
-            
-            if comando == "heartbeat":
-                # Atualiza tempo online
-                if peer.ultima_vez_visto > 0:
-                    peer.tempo_online += tempo_atual - peer.ultima_vez_visto
-                peer.ultima_vez_visto = tempo_atual
-                
-            elif comando == "upload":
-                # Registra bytes enviados
-                bytes_enviados = kwargs.get('bytes', 0)
-                peer.bytes_enviados += bytes_enviados
-                
-            elif comando == "download":
-                # Registra bytes recebidos
-                bytes_recebidos = kwargs.get('bytes', 0)
-                peer.bytes_recebidos += bytes_recebidos
-            
-            # Recalcula pontuação
-            peer.pontuacao = self._calcular_pontuacao(peer_id)
-
     def _processar_mensagem(self, mensagem: dict, addr: tuple) -> dict:
         """Processa uma mensagem recebida"""
         comando = mensagem.get("comando")
@@ -144,6 +91,8 @@ class Tracker:
             return self._buscar_arquivos(mensagem)
         elif comando == "heartbeat":
             return self._processar_heartbeat(mensagem)
+        elif comando == "metricas":
+            return self._atualizar_metricas(mensagem)
         else:
             return {"status": "erro", "mensagem": "Comando desconhecido"}
 
@@ -184,6 +133,7 @@ class Tracker:
                 peer.arquivos = set(mensagem["arquivos"])
             
             peer.ultima_vez_visto = time.time()
+            self._atualizar_pontuacao(peer_id)
             return {"status": "sucesso", "mensagem": "Peer atualizado"}
 
     def _info_peer(self, mensagem: dict) -> dict:
@@ -198,7 +148,7 @@ class Tracker:
                 "status": "sucesso",
                 "ip": peer.ip,
                 "porta": peer.porta,
-                "pontuacao": peer.pontuacao  # Adiciona pontuação na resposta
+                "pontuacao": peer.pontuacao
             }
 
     def _buscar_arquivos(self, mensagem: dict) -> dict:
@@ -219,7 +169,8 @@ class Tracker:
                             resultados[arquivo].append({
                                 "peer_id": peer_id,
                                 "ip": peer.ip,
-                                "porta": peer.porta
+                                "porta": peer.porta,
+                                "pontuacao": peer.pontuacao
                             })
                             logging.debug(f"Arquivo encontrado: {arquivo} no peer {peer_id}")
                 
@@ -237,10 +188,62 @@ class Tracker:
         """Processa heartbeat de um peer"""
         with self.lock:
             peer_id = mensagem.get("peer_id")
-            if peer_id in self.peers:
-                self.peers[peer_id].ultima_vez_visto = time.time()
-                return {"status": "sucesso", "mensagem": "Heartbeat recebido"}
-            return {"status": "erro", "mensagem": "Peer não encontrado"}
+            if peer_id not in self.peers:
+                return {"status": "erro", "mensagem": "Peer não encontrado"}
+                
+            peer = self.peers[peer_id]
+            agora = time.time()
+            
+            # Atualiza tempo online
+            if peer.ultima_vez_visto > 0:
+                peer.tempo_online += agora - peer.ultima_vez_visto
+            peer.ultima_vez_visto = agora
+            
+            self._atualizar_pontuacao(peer_id)
+            return {"status": "sucesso", "mensagem": "Heartbeat recebido"}
+
+    def _atualizar_metricas(self, mensagem: dict) -> dict:
+        """Atualiza métricas de um peer"""
+        peer_id = mensagem.get("peer_id")
+        tipo = mensagem.get("tipo")
+        bytes_total = mensagem.get("bytes", 0)
+        
+        with self.lock:
+            if peer_id not in self.peers:
+                return {"status": "erro", "mensagem": "Peer não encontrado"}
+                
+            peer = self.peers[peer_id]
+            
+            if tipo == "upload":
+                peer.bytes_enviados += bytes_total
+            elif tipo == "download":
+                peer.bytes_recebidos += bytes_total
+                
+            self._atualizar_pontuacao(peer_id)
+            return {"status": "sucesso", "mensagem": "Métricas atualizadas"}
+
+    def _atualizar_pontuacao(self, peer_id: str):
+        """Atualiza a pontuação de um peer"""
+        peer = self.peers[peer_id]
+        
+        # Fatores de pontuação
+        PESO_ARQUIVOS = 0.3    # 30% baseado no número de arquivos
+        PESO_UPLOAD = 0.4      # 40% baseado no volume de upload
+        PESO_TEMPO = 0.3       # 30% baseado no tempo online
+        
+        # Cálculo dos componentes
+        pontos_arquivos = min(1.0, len(peer.arquivos) / 10)  # Máximo com 10 arquivos
+        pontos_upload = min(1.0, peer.bytes_enviados / (100 * 1024 * 1024))  # Máximo com 100MB
+        pontos_tempo = min(1.0, peer.tempo_online / (24 * 3600))  # Máximo com 24 horas
+        
+        # Pontuação final (0.0 a 1.0)
+        peer.pontuacao = (
+            pontos_arquivos * PESO_ARQUIVOS +
+            pontos_upload * PESO_UPLOAD +
+            pontos_tempo * PESO_TEMPO
+        )
+        
+        logging.debug(f"Pontuação atualizada para {peer_id}: {peer.pontuacao:.2f}")
 
     def _limpar_peers_inativos(self):
         """Remove peers inativos"""

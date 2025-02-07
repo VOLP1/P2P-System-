@@ -7,7 +7,7 @@ import os
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Set
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -15,11 +15,196 @@ logging.basicConfig(
 )
 
 @dataclass
+class PartInfo:
+    """Informações sobre uma parte do arquivo"""
+    numero: int        # Número da parte
+    inicio: int       # Posição inicial no arquivo
+    tamanho: int      # Tamanho da parte
+    hash: str         # Hash da parte para verificação
+
+@dataclass
 class ArquivoInfo:
     """Informações sobre um arquivo compartilhado"""
     nome: str
     tamanho: int
     hash: str
+    tamanho_parte: int = 1024 * 1024  # 1MB por parte
+    partes: List[PartInfo] = None
+    
+    def __post_init__(self):
+        if self.partes is None:
+            self.partes = []
+            # Calcula número de partes necessárias
+            num_partes = (self.tamanho + self.tamanho_parte - 1) // self.tamanho_parte
+            posicao = 0
+            
+            for i in range(num_partes):
+                tamanho_atual = min(self.tamanho_parte, self.tamanho - posicao)
+                self.partes.append(PartInfo(i, posicao, tamanho_atual, ""))
+                posicao += tamanho_atual
+
+    def calcular_hashes(self, caminho: str):
+        """Calcula hashes de todas as partes"""
+        with open(caminho, 'rb') as f:
+            for parte in self.partes:
+                f.seek(parte.inicio)
+                dados = f.read(parte.tamanho)
+                parte.hash = hashlib.sha256(dados).hexdigest()
+
+class GerenciadorTransferencia:
+    """Gerencia a transferência paralela de arquivos"""
+    def __init__(self, peer_client, max_conexoes: int = 4):
+        self.peer_client = peer_client
+        self.max_conexoes = max_conexoes
+        self.downloads_ativos = {}
+        self.lock = threading.Lock()
+
+    def iniciar_download(self, peer_id: str, arquivo: ArquivoInfo, diretorio: str) -> bool:
+        """Inicia download paralelo de um arquivo"""
+        caminho = os.path.join(diretorio, arquivo.nome)
+        
+        # Cria arquivo vazio do tamanho correto
+        with open(caminho, 'wb') as f:
+            f.truncate(arquivo.tamanho)
+        
+        # Inicializa estado do download
+        with self.lock:
+            self.downloads_ativos[arquivo.nome] = {
+                'arquivo': arquivo,
+                'partes_pendentes': set(range(len(arquivo.partes))),
+                'partes_baixadas': set(),
+                'caminho': caminho,
+                'erros': 0
+            }
+        
+        # Inicia threads de download
+        for _ in range(min(self.max_conexoes, len(arquivo.partes))):
+            thread = threading.Thread(
+                target=self._thread_download,
+                args=(peer_id, arquivo.nome)
+            )
+            thread.daemon = True
+            thread.start()
+        
+        return True
+
+    def _thread_download(self, peer_id: str, nome_arquivo: str):
+        """Thread que baixa partes do arquivo"""
+        max_tentativas = 3  # Número máximo de tentativas por parte
+        
+        while True:
+            # Pega próxima parte para baixar
+            with self.lock:
+                download = self.downloads_ativos.get(nome_arquivo)
+                if not download:
+                    return
+                
+                if not download['partes_pendentes']:
+                    # Verifica se download terminou
+                    if len(download['partes_baixadas']) == len(download['arquivo'].partes):
+                        self._finalizar_download(nome_arquivo)
+                    return
+                
+                parte_num = next(iter(download['partes_pendentes']))
+                download['partes_pendentes'].remove(parte_num)
+            
+            # Baixa a parte
+            tentativas = 0
+            while tentativas < max_tentativas:
+                try:
+                    parte = download['arquivo'].partes[parte_num]
+                    if self._baixar_parte(peer_id, download['arquivo'], parte, download['caminho']):
+                        with self.lock:
+                            download['partes_baixadas'].add(parte_num)
+                        break
+                    tentativas += 1
+                except Exception as e:
+                    logging.error(f"Tentativa {tentativas + 1} falhou para parte {parte_num}: {e}")
+                    tentativas += 1
+            
+            if tentativas == max_tentativas:
+                with self.lock:
+                    download['partes_pendentes'].add(parte_num)
+                    download['erros'] += 1
+                    if download['erros'] > len(download['arquivo'].partes) * 2:
+                        logging.error(f"Muitos erros no download de {nome_arquivo}")
+                        return
+                    
+    def _baixar_parte(self, peer_id: str, arquivo: ArquivoInfo, parte: PartInfo, caminho: str) -> bool:
+        """Baixa uma parte específica do arquivo"""
+        sock = None
+        try:
+            # Obtém informações do peer
+            peer_info = self.peer_client._obter_info_peer(peer_id)
+            if not peer_info:
+                logging.error(f"Não foi possível obter informações do peer {peer_id}")
+                return False
+
+            # Estabelece conexão com o peer
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(30)  # Timeout de 30 segundos
+            sock.connect((peer_info['ip'], peer_info['porta']))
+            
+            # Solicita parte específica
+            mensagem = {
+                "tipo": "parte_arquivo",
+                "nome": arquivo.nome,
+                "parte": parte.numero,
+                "inicio": parte.inicio,
+                "tamanho": parte.tamanho
+            }
+            sock.send(json.dumps(mensagem).encode())
+            
+            # Recebe dados
+            recebido = 0
+            buffer = bytearray()
+            
+            while recebido < parte.tamanho:
+                dados = sock.recv(min(4096, parte.tamanho - recebido))
+                if not dados:
+                    raise Exception("Conexão fechada prematuramente")
+                buffer.extend(dados)
+                recebido += len(dados)
+                logging.debug(f"Progresso parte {parte.numero}: {(recebido/parte.tamanho)*100:.1f}%")
+            
+            # Verifica hash
+            hash_recebido = hashlib.sha256(buffer).hexdigest()
+            if hash_recebido != parte.hash:
+                raise Exception(f"Hash inválido para parte {parte.numero}")
+            
+            # Escreve no arquivo
+            with open(caminho, 'r+b') as f:
+                f.seek(parte.inicio)
+                f.write(buffer)
+            
+            logging.info(f"Parte {parte.numero} baixada com sucesso")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Erro baixando parte {parte.numero}: {str(e)}")
+            return False
+        finally:
+            if sock:
+                sock.close()
+
+    def _finalizar_download(self, nome_arquivo: str):
+        """Finaliza um download verificando sua integridade"""
+        with self.lock:
+            download = self.downloads_ativos.get(nome_arquivo)
+            if not download:
+                return
+                
+            # Verifica hash final
+            with open(download['caminho'], 'rb') as f:
+                hash_final = hashlib.sha256(f.read()).hexdigest()
+                
+            if hash_final != download['arquivo'].hash:
+                logging.error(f"Hash final inválido para {nome_arquivo}")
+                os.remove(download['caminho'])
+            else:
+                logging.info(f"Download de {nome_arquivo} concluído com sucesso")
+                
+            del self.downloads_ativos[nome_arquivo]
 
 class PeerClient:
     def __init__(self, host: str = "localhost", porta: int = 0, diretorio: str = "compartilhado"):
@@ -29,6 +214,7 @@ class PeerClient:
         self.peer_id = None
         self.arquivos: Dict[str, ArquivoInfo] = {}
         self.chats_ativos: Dict[str, socket.socket] = {}
+        self.gerenciador_transferencia = GerenciadorTransferencia(self)
         
         # Garante que o diretório existe
         os.makedirs(diretorio, exist_ok=True)
@@ -68,6 +254,20 @@ class PeerClient:
             logging.error(f"Erro ao enviar comando ao tracker: {e}")
             return {"status": "erro", "mensagem": str(e)}
 
+    def _obter_info_peer(self, peer_id: str) -> Optional[dict]:
+        """Obtém informações de um peer do tracker"""
+        resposta = self._enviar_comando_tracker({
+            "comando": "info_peer",
+            "peer_id": peer_id
+        })
+        
+        if resposta["status"] == "sucesso":
+            return {
+                "ip": resposta["ip"],
+                "porta": resposta["porta"]
+            }
+        return None
+
     def conectar_tracker(self, host: str, porta: int) -> bool:
         """Conecta ao tracker e registra o peer"""
         try:
@@ -80,8 +280,7 @@ class PeerClient:
                 "arquivos": list(self.arquivos.keys())
             }
             
-            self.socket_tracker.send(json.dumps(mensagem).encode())
-            resposta = json.loads(self.socket_tracker.recv(1024).decode())
+            resposta = self._enviar_comando_tracker(mensagem)
             
             if resposta["status"] == "sucesso":
                 self.peer_id = resposta["peer_id"]
@@ -111,14 +310,22 @@ class PeerClient:
         
         # Calcula informações
         tamanho = os.path.getsize(destino)
+        
+        # Cria informações do arquivo
+        info = ArquivoInfo(nome, tamanho, "")
+        
+        # Calcula hashes
         with open(destino, 'rb') as f:
+            # Hash do arquivo completo
             hash_obj = hashlib.sha256()
             for bloco in iter(lambda: f.read(4096), b''):
                 hash_obj.update(bloco)
-            hash_arquivo = hash_obj.hexdigest()
+            info.hash = hash_obj.hexdigest()
+            
+            # Hash das partes
+            info.calcular_hashes(destino)
         
         # Registra arquivo
-        info = ArquivoInfo(nome, tamanho, hash_arquivo)
         self.arquivos[nome] = info
         
         # Atualiza tracker
@@ -163,28 +370,14 @@ class PeerClient:
             
         try:
             # Obtém informações do peer
-            resposta = self._enviar_comando_tracker({
-                "comando": "info_peer",
-                "peer_id": peer_id
-            })
-            
-            if resposta["status"] != "sucesso":
-                logging.error(f"Erro na resposta do tracker: {resposta}")
-                return False
-            
-            # Extrai informações
-            ip = resposta.get("ip")
-            porta = resposta.get("porta")
-            logging.debug(f"Informações recebidas - IP: {ip}, Porta: {porta}")
-            
-            if not ip or not porta:
-                logging.error("IP ou porta não recebidos do tracker")
+            info_peer = self._obter_info_peer(peer_id)
+            if not info_peer:
                 return False
             
             # Conecta ao peer
-            logging.info(f"Tentando conectar a {ip}:{porta}")
+            logging.info(f"Tentando conectar a {info_peer['ip']}:{info_peer['porta']}")
             socket_chat = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            socket_chat.connect((ip, porta))
+            socket_chat.connect((info_peer['ip'], info_peer['porta']))
             
             # Envia identificação
             mensagem = {
@@ -206,7 +399,6 @@ class PeerClient:
             
         except Exception as e:
             logging.error(f"Erro ao iniciar chat: {str(e)}")
-            logging.debug("Erro detalhado:", exc_info=True)
             return False
 
     def enviar_mensagem_chat(self, peer_id: str, mensagem: str) -> bool:
@@ -232,24 +424,13 @@ class PeerClient:
         """Solicita download de arquivo de outro peer"""
         try:
             # Obtém informações do peer
-            resposta = self._enviar_comando_tracker({
-                "comando": "info_peer",
-                "peer_id": peer_id
-            })
-            
-            if resposta["status"] != "sucesso":
+            info_peer = self._obter_info_peer(peer_id)
+            if not info_peer:
                 return False
             
-            ip = resposta.get("ip")
-            porta = resposta.get("porta")
-            
-            if not ip or not porta:
-                logging.error("IP ou porta não recebidos do tracker")
-                return False
-            
-            # Estabelece conexão para transferência
+            # Estabelece conexão inicial para obter metadados
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((ip, porta))
+            sock.connect((info_peer['ip'], info_peer['porta']))
             
             # Solicita arquivo
             mensagem = {
@@ -258,22 +439,36 @@ class PeerClient:
             }
             sock.send(json.dumps(mensagem).encode())
             
-            # Recebe arquivo
-            caminho = os.path.join(self.diretorio, nome_arquivo)
-            with open(caminho, 'wb') as f:
-                while True:
-                    dados = sock.recv(4096)
-                    if not dados:
-                        break
-                    f.write(dados)
+            # Recebe metadados
+            dados = sock.recv(4096).decode()
+            metadados = json.loads(dados)
             
-            logging.info(f"Arquivo {nome_arquivo} recebido com sucesso")
-            return True
+            if metadados.get("tipo") == "erro":
+                logging.error(f"Erro ao solicitar arquivo: {metadados.get('mensagem')}")
+                return False
+            
+            # Cria objeto ArquivoInfo com as informações recebidas
+            info = ArquivoInfo(
+                nome=metadados["nome"],
+                tamanho=metadados["tamanho"],
+                hash=metadados["hash"]
+            )
+            
+            # Atualiza informações das partes
+            info.partes = []
+            for p in metadados["partes"]:
+                info.partes.append(PartInfo(
+                    numero=p["numero"],
+                    inicio=p["inicio"],
+                    tamanho=p["tamanho"],
+                    hash=p["hash"]
+                ))
+            
+            # Inicia download paralelo
+            return self.gerenciador_transferencia.iniciar_download(peer_id, info, self.diretorio)
             
         except Exception as e:
             logging.error(f"Erro ao solicitar arquivo: {e}")
-            if 'caminho' in locals() and os.path.exists(caminho):
-                os.remove(caminho)
             return False
 
     def _aceitar_conexoes(self):
@@ -304,20 +499,72 @@ class PeerClient:
                 self._receber_mensagens_chat(peer_id, sock)
                 
             elif tipo == "arquivo":
-                # Envia arquivo solicitado
+                # Envia informações do arquivo
                 nome = mensagem["nome"]
                 if nome in self.arquivos:
-                    caminho = os.path.join(self.diretorio, nome)
-                    with open(caminho, 'rb') as f:
-                        while True:
-                            dados = f.read(4096)
-                            if not dados:
-                                break
-                            sock.send(dados)
-                sock.close()
+                    info = self.arquivos[nome]
+                    # Envia metadados com informações das partes
+                    metadados = {
+                        "tipo": "metadados_arquivo",
+                        "nome": nome,
+                        "tamanho": info.tamanho,
+                        "hash": info.hash,
+                        "partes": [
+                            {
+                                "numero": p.numero,
+                                "inicio": p.inicio,
+                                "tamanho": p.tamanho,
+                                "hash": p.hash
+                            }
+                            for p in info.partes
+                        ]
+                    }
+                    sock.send(json.dumps(metadados).encode())
+                else:
+                    sock.send(json.dumps({
+                        "tipo": "erro",
+                        "mensagem": "Arquivo não encontrado"
+                    }).encode())
+                
+            elif tipo == "parte_arquivo":
+                # Envia parte específica do arquivo
+                nome = mensagem["nome"]
+                if nome in self.arquivos:
+                    numero_parte = mensagem["parte"]
+                    info = self.arquivos[nome]
+                    
+                    if 0 <= numero_parte < len(info.partes):
+                        parte = info.partes[numero_parte]
+                        caminho = os.path.join(self.diretorio, nome)
+                        
+                        try:
+                            with open(caminho, 'rb') as f:
+                                f.seek(parte.inicio)
+                                dados = f.read(parte.tamanho)
+                                # Verifica hash antes de enviar
+                                hash_atual = hashlib.sha256(dados).hexdigest()
+                                if hash_atual != parte.hash:
+                                    raise Exception("Hash da parte não confere")
+                                sock.send(dados)
+                                
+                            # Atualiza métricas
+                            self._enviar_comando_tracker({
+                                "comando": "metricas",
+                                "tipo": "upload",
+                                "peer_id": self.peer_id,
+                                "bytes": parte.tamanho
+                            })
+                            logging.info(f"Parte {numero_parte} enviada com sucesso")
+                        except Exception as e:
+                            logging.error(f"Erro ao enviar parte {numero_parte}: {e}")
+                    else:
+                        logging.error(f"Parte {numero_parte} inválida")
+                else:
+                    logging.error(f"Arquivo {nome} não encontrado")
                 
         except Exception as e:
             logging.error(f"Erro ao processar conexão: {e}")
+        finally:
             sock.close()
 
     def _receber_mensagens_chat(self, peer_id: str, sock: socket.socket):
@@ -347,7 +594,7 @@ class PeerClient:
                     "comando": "heartbeat",
                     "peer_id": self.peer_id
                 }
-                self.socket_tracker.send(json.dumps(mensagem).encode())
+                self._enviar_comando_tracker(mensagem)
                 time.sleep(30)
             except:
                 break
