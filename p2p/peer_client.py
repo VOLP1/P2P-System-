@@ -8,6 +8,8 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
+from p2p.rate_limiter import GerenciadorBanda
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -49,59 +51,6 @@ class ArquivoInfo:
                 dados = f.read(parte.tamanho)
                 parte.hash = hashlib.sha256(dados).hexdigest()
 
-class GerenciadorBanda:
-    """Gerenciador de banda simplificado com controle efetivo por peer"""
-    def __init__(self, taxa_base: int = 1024 * 1024):  # 1 MB/s base
-        self.taxa_base = taxa_base
-        self.lock = threading.Lock()
-        self.ultimas_transferencias = {}  # Último momento de transferência
-        self.bytes_periodo = {}          # Bytes transferidos no período atual
-        self.taxas_peers = {}            # Taxa atual de cada peer
-    
-    def atualizar_limite(self, peer_id: str, pontuacao: float):
-        """Define taxa baseada na pontuação"""
-        with self.lock:
-            # Taxa entre 100KB/s e 2MB/s
-            taxa_min = 100 * 1024  # 100 KB/s
-            taxa_max = 2 * 1024 * 1024  # 2 MB/s
-            
-            self.taxas_peers[peer_id] = taxa_min + (taxa_max - taxa_min) * pontuacao
-            self.ultimas_transferencias[peer_id] = time.time()
-            self.bytes_periodo[peer_id] = 0
-            
-            return self.taxas_peers[peer_id] / 1024  # Retorna KB/s
-    
-    def controlar_taxa(self, peer_id: str, tamanho: int):
-        """Controle estrito da taxa"""
-        with self.lock:
-            agora = time.time()
-            
-            if peer_id not in self.taxas_peers:
-                self.atualizar_limite(peer_id, 0.1)  # Taxa mínima default
-            
-            taxa = self.taxas_peers[peer_id]
-            ultimo = self.ultimas_transferencias[peer_id]
-            bytes_atual = self.bytes_periodo[peer_id]
-            
-            # Reseta contador após 1 segundo
-            if agora - ultimo >= 1.0:
-                self.bytes_periodo[peer_id] = 0
-                self.ultimas_transferencias[peer_id] = agora
-                bytes_atual = 0
-            
-            # Verifica se excederia a taxa
-            if bytes_atual + tamanho > taxa:
-                tempo_espera = (bytes_atual + tamanho - taxa) / taxa + 0.1
-                time.sleep(tempo_espera)
-                self.bytes_periodo[peer_id] = tamanho
-                self.ultimas_transferencias[peer_id] = time.time()
-            else:
-                self.bytes_periodo[peer_id] = bytes_atual + tamanho
-    
-    def obter_taxa_atual(self, peer_id: str) -> float:
-        """Retorna taxa em KB/s"""
-        with self.lock:
-            return self.taxas_peers.get(peer_id, 100 * 1024) / 1024
 
 class GerenciadorTransferencia:
     """Gerencia a transferência paralela de arquivos"""
@@ -110,18 +59,19 @@ class GerenciadorTransferencia:
         self.max_conexoes = max_conexoes
         self.downloads_ativos = {}
         self.downloads_concluidos = set()
-        self.lock = threading.Lock()
+        self.global_lock = threading.Lock()  
+        self.download_locks = {}  
         self.gerenciador_banda = GerenciadorBanda()
 
 
     def verificar_download_concluido(self, nome_arquivo: str) -> bool:
         """Verifica se um download foi concluído"""
-        with self.lock:
+        with self.global_lock:
             return nome_arquivo in self.downloads_concluidos
 
     def limpar_downloads_concluidos(self):
         """Limpa a lista de downloads concluídos"""
-        with self.lock:
+        with self.global_lock:
             self.downloads_concluidos.clear()
             
     def adicionar_arquivo(self, caminho: str):
@@ -132,11 +82,14 @@ class GerenciadorTransferencia:
             logging.error(f"Erro ao adicionar arquivo após download: {e}")
         
     def iniciar_download(self, peers_disponiveis: list, arquivo: ArquivoInfo, diretorio: str) -> bool:
-        """Inicia download paralelo de um arquivo de múltiplos peers"""
-        with self.lock:
+        """Inicia download paralelo com melhor distribuição de peers"""
+        with self.global_lock:
             if arquivo.nome in self.downloads_concluidos:
                 logging.info(f"Arquivo {arquivo.nome} já foi baixado recentemente.")
                 return False
+            
+            # Cria lock específico para este download
+            self.download_locks[arquivo.nome] = threading.Lock()
         
         caminho = os.path.join(diretorio, arquivo.nome)
         
@@ -144,37 +97,53 @@ class GerenciadorTransferencia:
         with open(caminho, 'wb') as f:
             f.write(b'\0' * arquivo.tamanho)
         
-        # Estado do download
-        with self.lock:
+        # Distribui partes entre peers disponíveis de forma balanceada
+        num_partes = len(arquivo.partes)
+        num_peers = len(peers_disponiveis)
+        partes_por_peer = num_partes // num_peers
+        partes_extras = num_partes % num_peers
+        
+        distribuicao_partes = {}
+        inicio = 0
+        
+        for i, peer in enumerate(peers_disponiveis):
+            num_partes_peer = partes_por_peer + (1 if i < partes_extras else 0)
+            fim = inicio + num_partes_peer
+            distribuicao_partes[peer['peer_id']] = list(range(inicio, fim))
+            inicio = fim
+        
+        # Inicializa estado do download
+        with self.global_lock:
             self.downloads_ativos[arquivo.nome] = {
                 'arquivo': arquivo,
                 'partes_pendentes': set(range(len(arquivo.partes))),
                 'partes_baixadas': set(),
                 'partes_em_progresso': {},
                 'peers_disponiveis': peers_disponiveis,
+                'distribuicao_partes': distribuicao_partes,
                 'caminho': caminho,
                 'erros_por_peer': {peer['peer_id']: 0 for peer in peers_disponiveis},
                 'total_erros': 0,
                 'threads': [],
-                'concluido': False
+                'concluido': False,
+                'stats_por_peer': {peer['peer_id']: {'bytes': 0, 'tempo': 0} for peer in peers_disponiveis}
             }
 
-        # Inicia threads de download
-        num_conexoes = min(self.max_conexoes, len(peers_disponiveis), len(arquivo.partes))
+        # Inicia threads de download - uma por peer disponível
         threads = []
-        for i in range(num_conexoes):
+        for peer in peers_disponiveis:
             thread = threading.Thread(
                 target=self._thread_download,
-                args=(arquivo.nome, i),
-                name=f"Download-{arquivo.nome}-{i}"
+                args=(arquivo.nome, peer['peer_id']),
+                name=f"Download-{arquivo.nome}-{peer['peer_id']}"
             )
             thread.daemon = True
             thread.start()
             threads.append(thread)
-            logging.info(f"Iniciada thread de download {i} para {arquivo.nome}")
+            logging.info(f"Iniciada thread de download para peer {peer['peer_id']}")
 
         # Armazena threads
-        with self.lock:
+        with self.global_lock:
             self.downloads_ativos[arquivo.nome]['threads'] = threads
 
         # Thread de monitoramento
@@ -188,161 +157,135 @@ class GerenciadorTransferencia:
 
         return True
 
+
     def _monitorar_download(self, nome_arquivo: str):
-        """Monitora o progresso do download com medições mais precisas"""
+        """Monitora o progresso do download com estatísticas por peer"""
         try:
             inicio_download = time.time()
             ultimo_progresso = time.time()
-            bytes_ultimo_progresso = 0
+            bytes_ultimo_progresso = {}
             
-            with self.lock:
+            with self.global_lock:
                 download = self.downloads_ativos.get(nome_arquivo)
                 if not download:
                     return
+                    
                 tamanho_total = download['arquivo'].tamanho
+                for peer_id in download['stats_por_peer']:
+                    bytes_ultimo_progresso[peer_id] = 0
             
-            # Loop de monitoramento
-            threads = download['threads']
-            threads_ativas = {t.name: True for t in threads}
-            
-            while any(threads_ativas.values()):
-                # Atualiza status das threads
-                for thread in threads:
-                    if not thread.is_alive() and threads_ativas[thread.name]:
-                        threads_ativas[thread.name] = False
-                
-                # Calcula progresso atual
-                with self.lock:
+            while True:
+                with self.global_lock:
                     download = self.downloads_ativos.get(nome_arquivo)
                     if not download:
                         return
                     
-                    bytes_baixados = len(download['partes_baixadas']) * download['arquivo'].tamanho_parte
+                    if not any(t.is_alive() for t in download['threads']):
+                        break
                     
-                    # Calcula velocidade instantânea
+                    # Calcula estatísticas por peer
                     agora = time.time()
                     tempo_decorrido = agora - ultimo_progresso
                     
-                    bytes_periodo = bytes_baixados - bytes_ultimo_progresso
-                    if tempo_decorrido > 0:
-                        velocidade = (bytes_periodo / 1024) / tempo_decorrido  # KB/s
-                        progresso = (bytes_baixados / tamanho_total) * 100
+                    if tempo_decorrido >= 1.0:  # Atualiza a cada segundo
+                        total_bytes = 0
+                        logging.info("\nEstatísticas de download por peer:")
                         
-                        logging.info(f"Progresso: {min(100, progresso):.1f}% - Velocidade: {velocidade:.1f} KB/s")
+                        for peer_id, stats in download['stats_por_peer'].items():
+                            bytes_periodo = stats['bytes'] - bytes_ultimo_progresso[peer_id]
+                            if bytes_periodo > 0:
+                                velocidade = (bytes_periodo / 1024) / tempo_decorrido  # KB/s
+                                logging.info(f"- Peer {peer_id}: {velocidade:.1f} KB/s")
+                                bytes_ultimo_progresso[peer_id] = stats['bytes']
+                                total_bytes += stats['bytes']
+                        
+                        progresso = (total_bytes / tamanho_total) * 100
+                        logging.info(f"Progresso total: {min(100, progresso):.1f}%")
                         
                         ultimo_progresso = agora
-                        bytes_ultimo_progresso = bytes_baixados
                 
-                time.sleep(0.1)  # Reduz uso de CPU
+                time.sleep(0.1)
             
             # Estatísticas finais
             tempo_total = time.time() - inicio_download
-            tamanho_mb = tamanho_total / (1024 * 1024)
-            velocidade_media = (tamanho_total / 1024) / tempo_total  # KB/s
-
-            # Verifica hash final
-            with self.lock:
-                download = self.downloads_ativos.get(nome_arquivo)
-                if not download:
-                    return
-                caminho = download['caminho']
-                
-            try:
-                with open(caminho, 'rb') as f:
-                    hash_final = hashlib.sha256(f.read()).hexdigest()
-                
-                if hash_final == download['arquivo'].hash:
-                    logging.info(f"\nDownload de {nome_arquivo} concluído com sucesso!")
-                    logging.info(f"Estatísticas finais:")
-                    logging.info(f"- Tamanho total: {tamanho_mb:.2f} MB")
-                    logging.info(f"- Tempo total: {tempo_total:.2f} segundos")
-                    logging.info(f"- Velocidade média: {velocidade_media:.2f} KB/s")
-                    
-                    self.adicionar_arquivo(caminho)
-                    download['concluido'] = True
-                    self.downloads_concluidos.add(nome_arquivo)
-                else:
-                    logging.error(f"Hash final inválido para {nome_arquivo}")
-                    os.remove(caminho)
-            except Exception as e:
-                logging.error(f"Erro ao verificar hash final: {e}")
+            self._finalizar_download(nome_arquivo, tempo_total)
             
-            with self.lock:
-                self.downloads_ativos.pop(nome_arquivo, None)
-
         except Exception as e:
             logging.error(f"Erro no monitor de download: {e}")
 
-    def _thread_download(self, nome_arquivo: str, thread_id: int):
-        """Thread que baixa partes do arquivo"""
+    def _thread_download(self, nome_arquivo: str, peer_id: str):
+        """Thread dedicada para download de partes de um peer específico"""
         max_tentativas = 3
         
         while True:
             parte_num = None
-            peer = None
             
-            with self.lock:
+            # Obtém próxima parte designada para este peer
+            with self.global_lock:
                 download = self.downloads_ativos.get(nome_arquivo)
                 if not download:
-                    return
-
-                if not download['partes_pendentes'] and not download['partes_em_progresso']:
                     return
 
                 if not download['partes_pendentes']:
                     return
 
-                parte_num = next(iter(download['partes_pendentes']))
+                # Pega apenas partes designadas para este peer
+                partes_designadas = set(download['distribuicao_partes'][peer_id])
+                partes_disponiveis = partes_designadas & download['partes_pendentes']
                 
-                peers_disponiveis = download['peers_disponiveis']
-                peers_em_uso = set(download['partes_em_progresso'].values())
-                
-                peers_possiveis = [p for p in peers_disponiveis if p['peer_id'] not in peers_em_uso]
-                if not peers_possiveis:
-                    peers_possiveis = peers_disponiveis
-                
-                peer = self._selecionar_melhor_peer(peers_possiveis, download['erros_por_peer'])
-                
-                if not peer:
-                    logging.error(f"Thread {thread_id}: Nenhum peer disponível")
-                    return
+                if not partes_disponiveis:
+                    # Verifica se há partes pendentes de outros peers com muitos erros
+                    todas_pendentes = download['partes_pendentes']
+                    if todas_pendentes:
+                        parte_num = min(todas_pendentes)  # Pega qualquer parte pendente
+                    else:
+                        return
+                else:
+                    parte_num = min(partes_disponiveis)
 
                 download['partes_pendentes'].remove(parte_num)
-                download['partes_em_progresso'][parte_num] = peer['peer_id']
+                download['partes_em_progresso'][parte_num] = peer_id
 
             # Tenta baixar a parte
+            inicio_download = time.time()
             tentativas = 0
             sucesso = False
             
             while tentativas < max_tentativas and not sucesso:
                 try:
                     parte = download['arquivo'].partes[parte_num]
-                    if self._baixar_parte(peer['peer_id'], download['arquivo'], parte, download['caminho']):
-                        with self.lock:
+                    if self._baixar_parte(peer_id, download['arquivo'], parte, download['caminho']):
+                        with self.global_lock:
                             download = self.downloads_ativos.get(nome_arquivo)
                             if download:
                                 download['partes_baixadas'].add(parte_num)
                                 download['partes_em_progresso'].pop(parte_num, None)
+                                
+                                # Atualiza estatísticas
+                                tempo_download = time.time() - inicio_download
+                                download['stats_por_peer'][peer_id]['bytes'] += parte.tamanho
+                                download['stats_por_peer'][peer_id]['tempo'] += tempo_download
                         sucesso = True
                     else:
                         tentativas += 1
-                        with self.lock:
+                        with self.global_lock:
                             download = self.downloads_ativos.get(nome_arquivo)
                             if download:
-                                download['erros_por_peer'][peer['peer_id']] += 1
+                                download['erros_por_peer'][peer_id] += 1
                                 download['total_erros'] += 1
                 except Exception as e:
-                    logging.error(f"Thread {thread_id}: Erro ao baixar parte {parte_num}: {e}")
+                    logging.error(f"Erro ao baixar parte {parte_num} do peer {peer_id}: {e}")
                     tentativas += 1
 
             if not sucesso:
-                with self.lock:
+                with self.global_lock:
                     download = self.downloads_ativos.get(nome_arquivo)
                     if download:
                         download['partes_pendentes'].add(parte_num)
                         download['partes_em_progresso'].pop(parte_num, None)
                         if download['total_erros'] > len(download['arquivo'].partes) * 3:
                             return
+
 
     def _baixar_parte(self, peer_id: str, arquivo: ArquivoInfo, parte: PartInfo, caminho: str) -> bool:
         """Baixa uma parte específica do arquivo"""
@@ -397,7 +340,7 @@ class GerenciadorTransferencia:
                 return False
             
             # Escreve no arquivo
-            with self.lock:
+            with self.global_lock:
                 with open(caminho, 'r+b') as f:
                     f.seek(parte.inicio)
                     f.write(buffer)
@@ -423,6 +366,54 @@ class GerenciadorTransferencia:
                 melhor_peer = peer
         
         return melhor_peer
+    
+    def _finalizar_download(self, nome_arquivo: str, tempo_total: float):
+        """Finaliza o processo de download"""
+        try:
+            with self.global_lock:
+                download = self.downloads_ativos.get(nome_arquivo)
+                if not download:
+                    return
+
+                # Verifica integridade do download
+                arquivo = download['arquivo']
+                caminho = download['caminho']
+
+                # Calcula hash do arquivo baixado
+                with open(caminho, 'rb') as f:
+                    hash_obj = hashlib.sha256()
+                    for bloco in iter(lambda: f.read(4096), b''):
+                        hash_obj.update(bloco)
+                    hash_calculado = hash_obj.hexdigest()
+
+                # Verifica se o hash corresponde
+                if hash_calculado != arquivo.hash:
+                    logging.error(f"Erro: Hash do arquivo {nome_arquivo} não corresponde")
+                    # Pode adicionar lógica para tentar baixar novamente
+                    os.remove(caminho)
+                    return
+
+                # Registra download como concluído
+                self.downloads_concluidos.add(nome_arquivo)
+                
+                # Adiciona o arquivo ao peer
+                self.adicionar_arquivo(caminho)
+
+                # Calcula estatísticas
+                tamanho_total = arquivo.tamanho
+                velocidade_media = (tamanho_total / 1024) / tempo_total  # KB/s
+
+                # Logs de conclusão
+                logging.info(f"\nDownload concluído: {nome_arquivo}")
+                logging.info(f"Tamanho: {tamanho_total} bytes")
+                logging.info(f"Tempo total: {tempo_total:.2f} segundos")
+                logging.info(f"Velocidade média: {velocidade_media:.2f} KB/s")
+
+                # Limpa estado do download
+                del self.downloads_ativos[nome_arquivo]
+
+        except Exception as e:
+            logging.error(f"Erro ao finalizar download: {e}")
 
 class PeerClient:
     def __init__(self, host: str = "localhost", porta: int = 0, diretorio: str = "compartilhado"):
